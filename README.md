@@ -29,7 +29,7 @@ LowMemoryLLM is a lightweight inference implementation for Large Language Models
 
 ## Installation
 ```bash
-git clone https://github.com/yourusername/LowMemoryLLM.git
+git clone https://github.com/2404589803/LowMemoryLLM.git
 cd LowMemoryLLM
 mkdir build && cd build
 cmake ..
