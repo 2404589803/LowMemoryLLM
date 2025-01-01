@@ -1,0 +1,5 @@
+D:/c progect/LowMemoryLLM/build/CMakeFiles/test_download.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/test_inference.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/generate_weights.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/edit_cache.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/rebuild_cache.dir

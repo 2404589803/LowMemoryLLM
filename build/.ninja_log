@@ -1,0 +1,17 @@
+# ninja log v6
+97	173	7574518931427527	test_inference.exe	442d9e9a77cc281b
+7	1089	7574517496559815	CMakeFiles/test_download.dir/tests/test_download.c.obj	1efb18fb258ab71a
+9	1131	7574517496589808	CMakeFiles/test_download.dir/src/download.c.obj	4a1781c9f1f6023e
+9	99	7574517682472169	test_download.exe	863aacba1c1538d0
+11	1046	7574517496609812	CMakeFiles/test_inference.dir/tests/test_inference.c.obj	57302f1617c946d0
+2	132	7574521209864806	build.ninja	adb43e617dadaf89
+14	1150	7574517496629813	CMakeFiles/test_inference.dir/src/download.c.obj	15f867c5642e149f
+4	97	7574518930492106	CMakeFiles/test_inference.dir/src/inference.c.obj	38c3d1832cc404ec
+5	66	7574518930502097	CMakeFiles/generate_weights.dir/tools/generate_weights.c.obj	3f74598da4480596
+67	140	7574518931122115	generate_weights.exe	307d2e2566ac2f60
+8	71	7574521250688120	CMakeFiles/generate_weights.dir/tools/generate_weights.c.obj	3f74598da4480596
+71	165	7574521251328148	generate_weights.exe	307d2e2566ac2f60
+6	772	7574521250678138	CMakeFiles/test_inference.dir/tests/test_inference.c.obj	57302f1617c946d0
+5	777	7574521250668140	CMakeFiles/test_download.dir/tests/test_download.c.obj	1efb18fb258ab71a
+772	857	7574521258340792	test_inference.exe	442d9e9a77cc281b
+777	857	7574521258390789	test_download.exe	863aacba1c1538d0
