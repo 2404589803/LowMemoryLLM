@@ -1,0 +1,32 @@
+[
+{
+  "directory": "D:/c progect/LowMemoryLLM/build",
+  "command": "C:\\msys64\\mingw64\\bin\\gcc.exe  @CMakeFiles/low_memory_llm.dir/includes_C.rsp -g -std=gnu11 -o CMakeFiles\\low_memory_llm.dir\\src\\download.c.obj -c \"D:\\c progect\\LowMemoryLLM\\src\\download.c\"",
+  "file": "D:/c progect/LowMemoryLLM/src/download.c",
+  "output": "CMakeFiles/low_memory_llm.dir/src/download.c.obj"
+},
+{
+  "directory": "D:/c progect/LowMemoryLLM/build",
+  "command": "C:\\msys64\\mingw64\\bin\\gcc.exe  @CMakeFiles/low_memory_llm.dir/includes_C.rsp -g -std=gnu11 -o CMakeFiles\\low_memory_llm.dir\\src\\extreme_compress.c.obj -c \"D:\\c progect\\LowMemoryLLM\\src\\extreme_compress.c\"",
+  "file": "D:/c progect/LowMemoryLLM/src/extreme_compress.c",
+  "output": "CMakeFiles/low_memory_llm.dir/src/extreme_compress.c.obj"
+},
+{
+  "directory": "D:/c progect/LowMemoryLLM/build",
+  "command": "C:\\msys64\\mingw64\\bin\\gcc.exe  @CMakeFiles/low_memory_llm.dir/includes_C.rsp -g -std=gnu11 -o CMakeFiles\\low_memory_llm.dir\\src\\tensor.c.obj -c \"D:\\c progect\\LowMemoryLLM\\src\\tensor.c\"",
+  "file": "D:/c progect/LowMemoryLLM/src/tensor.c",
+  "output": "CMakeFiles/low_memory_llm.dir/src/tensor.c.obj"
+},
+{
+  "directory": "D:/c progect/LowMemoryLLM/build",
+  "command": "C:\\msys64\\mingw64\\bin\\gcc.exe  @CMakeFiles/low_memory_llm.dir/includes_C.rsp -g -std=gnu11 -o CMakeFiles\\low_memory_llm.dir\\src\\inference.c.obj -c \"D:\\c progect\\LowMemoryLLM\\src\\inference.c\"",
+  "file": "D:/c progect/LowMemoryLLM/src/inference.c",
+  "output": "CMakeFiles/low_memory_llm.dir/src/inference.c.obj"
+},
+{
+  "directory": "D:/c progect/LowMemoryLLM/build/tests",
+  "command": "C:\\msys64\\mingw64\\bin\\gcc.exe  @CMakeFiles/test_download.dir/includes_C.rsp -g -std=gnu11 -o CMakeFiles\\test_download.dir\\test_download.c.obj -c \"D:\\c progect\\LowMemoryLLM\\tests\\test_download.c\"",
+  "file": "D:/c progect/LowMemoryLLM/tests/test_download.c",
+  "output": "tests/CMakeFiles/test_download.dir/test_download.c.obj"
+}
+]

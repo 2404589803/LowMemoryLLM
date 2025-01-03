@@ -1,5 +1,14 @@
-D:/c progect/LowMemoryLLM/build/CMakeFiles/test_download.dir
-D:/c progect/LowMemoryLLM/build/CMakeFiles/test_inference.dir
-D:/c progect/LowMemoryLLM/build/CMakeFiles/generate_weights.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/low_memory_llm.dir
 D:/c progect/LowMemoryLLM/build/CMakeFiles/edit_cache.dir
 D:/c progect/LowMemoryLLM/build/CMakeFiles/rebuild_cache.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/list_install_components.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/install.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/install/local.dir
+D:/c progect/LowMemoryLLM/build/CMakeFiles/install/strip.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/test_download.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/edit_cache.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/rebuild_cache.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/list_install_components.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/install.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/install/local.dir
+D:/c progect/LowMemoryLLM/build/tests/CMakeFiles/install/strip.dir

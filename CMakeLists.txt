@@ -1,39 +1,35 @@
 cmake_minimum_required(VERSION 3.10)
 project(LowMemoryLLM C)
 
-# 查找CURL包
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# 添加依赖包
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(cJSON REQUIRED)
 
-# 包含目录
-include_directories(${CURL_INCLUDE_DIRS})
-include_directories(${PROJECT_SOURCE_DIR}/include)
+# 添加子目录
+add_subdirectory(src)
+add_subdirectory(tests)
 
-# 添加源文件
-add_executable(test_download 
-    tests/test_download.c
-    src/download.c
+# 设置包含目录
+include_directories(
+    ${CMAKE_SOURCE_DIR}/include
+    ${CURL_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+    ${ZLIB_INCLUDE_DIRS}
+    ${CJSON_INCLUDE_DIRS}
 )
 
-# 添加推理测试可执行文件
-add_executable(test_inference
-    tests/test_inference.c
-    src/inference.c
-    src/download.c
+# 设置链接库
+set(COMMON_LIBS
+    ${CURL_LIBRARIES}
+    ${OPENSSL_LIBRARIES}
+    ${ZLIB_LIBRARIES}
+    ${CJSON_LIBRARIES}
 )
 
-# 添加权重生成工具
-add_executable(generate_weights
-    tools/generate_weights.c
-)
-
-# 链接CURL库
-target_link_libraries(test_download ${CURL_LIBRARIES})
-target_link_libraries(test_inference ${CURL_LIBRARIES})
-
-# 添加运行时依赖
-if(WIN32)
-    file(COPY 
-        "C:/msys64/mingw64/bin/libcurl-4.dll"
-        DESTINATION ${CMAKE_BINARY_DIR}
-    )
-endif() 
+# 导出链接库变量给子目录使用
+set(COMMON_LIBS ${COMMON_LIBS} PARENT_SCOPE) 

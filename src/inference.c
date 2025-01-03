@@ -1,613 +1,763 @@
 #include "low_memory_llm.h"
-#include <string.h>
-#include <math.h>
 #include <stdio.h>
-#include <stdarg.h>
+#include <string.h>
+#include <windows.h>
+#include <zlib.h>
+#include <direct.h>
+#include <time.h>
+#include <math.h>
+#include <float.h>
 
-// 全局状态
-static LLMState* g_state = NULL;
-static MemoryManager* g_memory_manager = NULL;
-static LLMConfig* g_config = NULL;
+#define WEIGHT_CHUNK_SIZE (4 * 1024)  // 4KB权重块
+#define VM_PAGE_SIZE (4 * 1024)       // 4KB虚拟内存页
+#define MAX_ACTIVE_PAGES 1024
+#define SWAP_FILE_PREFIX "weight_page"
+#define CACHE_DIR "weight_cache"
+#define PAGE_SIZE (4 * 1024 * 1024)  // 4MB per page
 
-// 错误处理
-static char g_error_buffer[1024];
-static void set_error(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(g_error_buffer, sizeof(g_error_buffer), fmt, args);
-    va_end(args);
+static LLMState* g_model_state = NULL;
+static WeightCache g_weight_cache = {0};
+
+// 初始化控制台编码
+static void init_console_encoding(void) {
+    // 设置控制台输出代码页为UTF-8
+    SetConsoleOutputCP(65001);
+    // 设置控制台输入代码页为UTF-8
+    SetConsoleCP(65001);
+    
+    // 获取标准输出句柄
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        GetConsoleMode(hOut, &dwMode);
+        // 启用虚拟终端序列
+        dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        SetConsoleMode(hOut, dwMode);
+    }
 }
 
-// 内存管理辅助函数
-static int ensure_memory_available(size_t size) {
-    if (size > g_memory_manager->available_ram) {
-        // 尝试内存整理
-        llm_memory_defrag();
-        
-        // 如果还是不够，尝试交换到磁盘
-        if (size > g_memory_manager->available_ram && g_memory_manager->use_disk_offload) {
-            // TODO: 实现内存交换策略
-            return 1;
+// 打印UTF-8编码的消息
+static void print_utf8(const char* message) {
+    // 获取当前代码页
+    UINT oldcp = GetConsoleOutputCP();
+    // 临时切换到UTF-8
+    SetConsoleOutputCP(65001);
+    printf("%s", message);
+    // 恢复原来的代码页
+    SetConsoleOutputCP(oldcp);
+}
+
+// 初始化权重缓存
+static int init_weight_cache(void) {
+    memset(&g_weight_cache, 0, sizeof(WeightCache));
+    snprintf(g_weight_cache.cache_dir, sizeof(g_weight_cache.cache_dir), "%s", CACHE_DIR);
+    _mkdir(g_weight_cache.cache_dir);
+    return 0;
+}
+
+// 生成交换文件名
+static void generate_swap_filename(char* filename, size_t size, uint64_t page_id) {
+    snprintf(filename, size, "%s/%s%llu.bin", 
+             g_weight_cache.cache_dir, SWAP_FILE_PREFIX, page_id);
+}
+
+// 将页面写入交换文件
+static int write_page_to_swap(VMPage* page) {
+    if (!page->is_dirty) return 0;
+
+    char filename[256];
+    generate_swap_filename(filename, sizeof(filename), page->page_id);
+
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) {
+        print_utf8("错误：无法创建交换文件\n");
+        return -1;
+    }
+
+    // 压缩数据
+    uLong compressed_size = compressBound(page->size);
+    unsigned char* compressed_data = (unsigned char*)malloc(compressed_size);
+    if (!compressed_data) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (compress2(compressed_data, &compressed_size, page->data, page->size, 
+                 Z_BEST_COMPRESSION) != Z_OK) {
+        free(compressed_data);
+        fclose(fp);
+        return -1;
+    }
+
+    size_t written = fwrite(compressed_data, 1, compressed_size, fp);
+    free(compressed_data);
+    fclose(fp);
+
+    return (written == compressed_size) ? 0 : -1;
+}
+
+// 从交换文件读取页面
+static int read_page_from_swap(VMPage* page) {
+    char filename[256];
+    generate_swap_filename(filename, sizeof(filename), page->page_id);
+
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) return -1;
+
+    // 获取压缩数据大小
+    fseek(fp, 0, SEEK_END);
+    size_t compressed_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    unsigned char* compressed_data = (unsigned char*)malloc(compressed_size);
+    if (!compressed_data) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (fread(compressed_data, 1, compressed_size, fp) != compressed_size) {
+        free(compressed_data);
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    // 解压数据
+    uLong decompressed_size = page->size;
+    if (uncompress(page->data, &decompressed_size, compressed_data, compressed_size) != Z_OK) {
+        free(compressed_data);
+        return -1;
+    }
+
+    free(compressed_data);
+    return 0;
+}
+
+// 查找最旧的页面
+static VMPage* find_oldest_page(void) {
+    if (g_weight_cache.active_pages == 0) return NULL;
+
+    VMPage* oldest = &g_weight_cache.pages[0];
+    for (size_t i = 1; i < g_weight_cache.active_pages; i++) {
+        if (g_weight_cache.pages[i].last_access < oldest->last_access) {
+            oldest = &g_weight_cache.pages[i];
         }
-        return 0;
     }
-    return 1;
+    return oldest;
 }
 
-// 张量创建和管理
-Tensor* tensor_create(size_t* shape, size_t ndim, QuantType quant_type) {
-    Tensor* tensor = (Tensor*)malloc(sizeof(Tensor));
-    if (!tensor) {
-        set_error("无法分配张量结构内存");
-        return NULL;
-    }
-    
-    tensor->ndim = ndim;
-    tensor->shape = (size_t*)malloc(ndim * sizeof(size_t));
-    if (!tensor->shape) {
-        free(tensor);
-        set_error("无法分配形状数组内存");
-        return NULL;
-    }
-    
-    memcpy(tensor->shape, shape, ndim * sizeof(size_t));
-    
-    // 计算总大小
-    size_t total_size = 1;
-    for (size_t i = 0; i < ndim; i++) {
-        total_size *= shape[i];
-    }
-    tensor->size = total_size;
-    
-    // 根据量化类型分配内存
-    size_t elem_size;
-    switch (quant_type) {
-        case QUANT_INT8:
-            elem_size = sizeof(int8_t);
-            break;
-        case QUANT_INT4:
-            elem_size = sizeof(int8_t) / 2;  // 4位，两个数存在一个字节中
-            break;
-        case QUANT_INT2:
-            elem_size = sizeof(int8_t) / 4;  // 2位，四个数存在一个字节中
-            break;
-        default:
-            elem_size = sizeof(float);
-    }
-    
-    size_t data_size = (total_size * elem_size + 7) / 8 * 8;  // 8字节对齐
-    if (!ensure_memory_available(data_size)) {
-        free(tensor->shape);
-        free(tensor);
-        set_error("内存不足，无法分配张量数据");
-        return NULL;
-    }
-    
-    tensor->data = malloc(data_size);
-    if (!tensor->data) {
-        free(tensor->shape);
-        free(tensor);
-        set_error("无法分配张量数据内存");
-        return NULL;
-    }
-    
-    tensor->quant_type = quant_type;
-    tensor->scales = NULL;
-    tensor->zero_points = NULL;
-    tensor->is_view = 0;
-    
-    return tensor;
-}
-
-void tensor_free(Tensor* tensor) {
-    if (!tensor) return;
-    
-    if (!tensor->is_view) {
-        free(tensor->data);
-        free(tensor->scales);
-        free(tensor->zero_points);
-    }
-    free(tensor->shape);
-    free(tensor);
-}
-
-// 量化函数
-int tensor_quantize(Tensor* tensor, QuantConfig* config) {
-    if (!tensor || !config) {
-        set_error("无效的参数");
-        return 0;
-    }
-    
-    // 只能量化FP32张量
-    if (tensor->quant_type != QUANT_NONE) {
-        set_error("只能量化FP32张量");
-        return 0;
-    }
-    
-    float* fp32_data = (float*)tensor->data;
-    size_t num_elements = tensor->size;
-    
-    // 计算量化参数
-    if (config->per_channel) {
-        // TODO: 实现按通道量化
-    } else {
-        // 全局量化
-        float max_val = fp32_data[0];
-        float min_val = fp32_data[0];
-        
-        // 找到数据范围
-        for (size_t i = 1; i < num_elements; i++) {
-            if (fp32_data[i] > max_val) max_val = fp32_data[i];
-            if (fp32_data[i] < min_val) min_val = fp32_data[i];
+// 获取或创建页面
+static VMPage* get_or_create_page(uint64_t page_id, size_t size) {
+    // 检查是否已存在
+    for (size_t i = 0; i < g_weight_cache.active_pages; i++) {
+        if (g_weight_cache.pages[i].page_id == page_id) {
+            g_weight_cache.pages[i].last_access = time(NULL);
+            return &g_weight_cache.pages[i];
         }
-        
-        // 计算量化参数
-        float scale;
-        float zero_point;
-        
-        switch (config->quant_type) {
-            case QUANT_INT8: {
-                if (config->symmetric) {
-                    float abs_max = fmaxf(fabsf(min_val), fabsf(max_val));
-                    scale = abs_max / 127.0f;
-                    zero_point = 0;
-                } else {
-                    scale = (max_val - min_val) / 255.0f;
-                    zero_point = -min_val / scale;
-                }
-                
-                // 分配新内存
-                int8_t* int8_data = (int8_t*)malloc(num_elements);
-                if (!int8_data) {
-                    set_error("无法分配量化后的内存");
-                    return 0;
-                }
-                
-                // 执行量化
-                for (size_t i = 0; i < num_elements; i++) {
-                    float scaled = fp32_data[i] / scale + zero_point;
-                    int32_t rounded = (int32_t)(scaled + (scaled >= 0 ? 0.5f : -0.5f));
-                    int8_data[i] = (int8_t)fminf(fmaxf(rounded, -128), 127);
-                }
-                
-                // 更新张量
-                free(tensor->data);
-                tensor->data = int8_data;
-                tensor->quant_type = QUANT_INT8;
-                
-                // 保存量化参数
-                tensor->scales = (float*)malloc(sizeof(float));
-                tensor->zero_points = (float*)malloc(sizeof(float));
-                if (!tensor->scales || !tensor->zero_points) {
-                    set_error("无法分配量化参数内存");
-                    return 0;
-                }
-                tensor->scales[0] = scale;
-                tensor->zero_points[0] = zero_point;
-                break;
+    }
+
+    // 如果达到最大页面数，交换出最旧的页面
+    if (g_weight_cache.active_pages >= MAX_ACTIVE_PAGES) {
+        VMPage* oldest = find_oldest_page();
+        if (oldest) {
+            if (oldest->is_dirty) {
+                write_page_to_swap(oldest);
             }
-            
-            case QUANT_INT4:
-                // TODO: 实现INT4量化
-                set_error("INT4量化尚未实现");
-                return 0;
-            
-            case QUANT_INT2:
-                // TODO: 实现INT2量化
-                set_error("INT2量化尚未实现");
-                return 0;
-            
-            default:
-                set_error("不支持的量化类型");
-                return 0;
+            if (oldest->data) {
+                free(oldest->data);
+            }
+            oldest->data = malloc(size);
+            if (!oldest->data) return NULL;
+            oldest->size = size;
+            oldest->page_id = page_id;
+            oldest->is_dirty = 0;
+            oldest->last_access = time(NULL);
+            read_page_from_swap(oldest);
+            return oldest;
         }
+        return NULL;
     }
-    
-    return 1;
+
+    // 创建新页面
+    VMPage* page = &g_weight_cache.pages[g_weight_cache.active_pages++];
+    page->data = malloc(size);
+    if (!page->data) return NULL;
+    page->size = size;
+    page->page_id = page_id;
+    page->is_dirty = 0;
+    page->last_access = time(NULL);
+    return page;
 }
 
-// 矩阵乘法实现
-int matrix_multiply(Tensor* a, Tensor* b, Tensor* c, MemoryManager* mem_manager) {
-    if (!a || !b || !c || !mem_manager) {
-        set_error("无效的参数");
-        return 0;
+// 读取权重数据
+static int read_weight_data(void* dest, size_t offset, size_t size) {
+    uint64_t page_id = offset / VM_PAGE_SIZE;
+    size_t page_offset = offset % VM_PAGE_SIZE;
+    size_t remaining = size;
+    char* dest_ptr = (char*)dest;
+
+    while (remaining > 0) {
+        size_t chunk_size = (remaining < VM_PAGE_SIZE - page_offset) ? 
+                           remaining : (VM_PAGE_SIZE - page_offset);
+
+        VMPage* page = get_or_create_page(page_id, VM_PAGE_SIZE);
+        if (!page) return -1;
+
+        memcpy(dest_ptr, (char*)page->data + page_offset, chunk_size);
+        
+        dest_ptr += chunk_size;
+        remaining -= chunk_size;
+        page_offset = 0;
+        page_id++;
     }
-    
-    // 检查维度
-    if (a->ndim != 2 || b->ndim != 2 || c->ndim != 2) {
-        set_error("矩阵乘法需要2维张量");
-        return 0;
+
+    return 0;
+}
+
+// 写入权重数据
+static int write_weight_data(const void* src, size_t offset, size_t size) {
+    uint64_t page_id = offset / VM_PAGE_SIZE;
+    size_t page_offset = offset % VM_PAGE_SIZE;
+    size_t remaining = size;
+    const char* src_ptr = (const char*)src;
+
+    while (remaining > 0) {
+        size_t chunk_size = (remaining < VM_PAGE_SIZE - page_offset) ? 
+                           remaining : (VM_PAGE_SIZE - page_offset);
+
+        VMPage* page = get_or_create_page(page_id, VM_PAGE_SIZE);
+        if (!page) return -1;
+
+        memcpy((char*)page->data + page_offset, src_ptr, chunk_size);
+        page->is_dirty = 1;
+        
+        src_ptr += chunk_size;
+        remaining -= chunk_size;
+        page_offset = 0;
+        page_id++;
     }
+
+    return 0;
+}
+
+// 流式矩阵乘法 - 使用极小内存块进行计算
+static int stream_matrix_multiply(const Tensor* a, const Tensor* b, Tensor* c) {
+    if (!a || !b || !c) return -1;
     
     size_t M = a->shape[0];
     size_t K = a->shape[1];
     size_t N = b->shape[1];
     
+    // 验证维度
     if (b->shape[0] != K || c->shape[0] != M || c->shape[1] != N) {
-        set_error("矩阵维度不匹配");
-        return 0;
+        return -1;
     }
     
-    // 如果输入已量化，先反量化
-    float* a_data = (float*)a->data;
-    float* b_data = (float*)b->data;
-    float* c_data = (float*)c->data;
+    // 使用1KB的缓冲区
+    #define BLOCK_SIZE 32  // 32个float = 128字节
+    float row_buffer[BLOCK_SIZE];
+    float col_buffer[BLOCK_SIZE];
+    float result_buffer[BLOCK_SIZE];
     
-    if (a->quant_type != QUANT_NONE || b->quant_type != QUANT_NONE) {
-        // TODO: 实现量化矩阵乘法
-        set_error("量化矩阵乘法尚未实现");
-        return 0;
-    }
-    
-    // 分块矩阵乘法
-    size_t block_size = 32;  // 可调整的分块大小
-    size_t num_blocks_M = (M + block_size - 1) / block_size;
-    size_t num_blocks_N = (N + block_size - 1) / block_size;
-    size_t num_blocks_K = (K + block_size - 1) / block_size;
-    
-    // 对每个分块进行计算
-    for (size_t i = 0; i < num_blocks_M; i++) {
-        size_t start_m = i * block_size;
-        size_t end_m = fmin(start_m + block_size, M);
-        
-        for (size_t j = 0; j < num_blocks_N; j++) {
-            size_t start_n = j * block_size;
-            size_t end_n = fmin(start_n + block_size, N);
+    // 分块计算
+    for (size_t i = 0; i < M; i++) {
+        // 每次处理一行
+        for (size_t j = 0; j < N; j++) {
+            float sum = 0.0f;
             
-            // 清零目标块
-            for (size_t m = start_m; m < end_m; m++) {
-                for (size_t n = start_n; n < end_n; n++) {
-                    c_data[m * N + n] = 0.0f;
+            // 分块加载和计算
+            for (size_t k = 0; k < K; k += BLOCK_SIZE) {
+                size_t block_size = (k + BLOCK_SIZE > K) ? (K - k) : BLOCK_SIZE;
+                
+                // 加载A矩阵的一块
+                if (read_weight_data(row_buffer, 
+                    (i * K + k) * sizeof(float), 
+                    block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 加载B矩阵的一块
+                if (read_weight_data(col_buffer,
+                    (k * N + j) * sizeof(float),
+                    block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 计算点积
+                for (size_t b = 0; b < block_size; b++) {
+                    sum += row_buffer[b] * col_buffer[b];
                 }
             }
             
-            // 累积结果
-            for (size_t k = 0; k < num_blocks_K; k++) {
-                size_t start_k = k * block_size;
-                size_t end_k = fmin(start_k + block_size, K);
+            // 写入结果
+            if (write_weight_data(&sum, 
+                (i * N + j) * sizeof(float),
+                sizeof(float)) != 0) {
+                return -1;
+            }
+        }
+    }
+    
+    return 0;
+}
+
+// 流式注意力计算 - 使用极小内存块
+static int stream_attention(const Tensor* query, const Tensor* key, const Tensor* value,
+                          Tensor* output, float scale) {
+    if (!query || !key || !value || !output) return -1;
+    
+    size_t seq_len = query->shape[0];
+    size_t head_dim = query->shape[1];
+    
+    // 验证维度
+    if (key->shape[0] != seq_len || key->shape[1] != head_dim ||
+        value->shape[0] != seq_len || value->shape[1] != head_dim ||
+        output->shape[0] != seq_len || output->shape[1] != head_dim) {
+        return -1;
+    }
+    
+    // 使用1KB的缓冲区
+    #define ATT_BLOCK_SIZE 16  // 16个float = 64字节
+    float q_buffer[ATT_BLOCK_SIZE];
+    float k_buffer[ATT_BLOCK_SIZE];
+    float v_buffer[ATT_BLOCK_SIZE];
+    float scores[ATT_BLOCK_SIZE];
+    float max_score = -FLT_MAX;
+    float sum_exp = 0.0f;
+    
+    // 分块计算注意力
+    for (size_t i = 0; i < seq_len; i++) {
+        // 计算当前query与所有key的得分
+        for (size_t j = 0; j < seq_len; j++) {
+            float score = 0.0f;
+            
+            // 分块计算点积
+            for (size_t k = 0; k < head_dim; k += ATT_BLOCK_SIZE) {
+                size_t block_size = (k + ATT_BLOCK_SIZE > head_dim) ? 
+                                  (head_dim - k) : ATT_BLOCK_SIZE;
                 
-                for (size_t m = start_m; m < end_m; m++) {
-                    for (size_t n = start_n; n < end_n; n++) {
-                        float sum = 0.0f;
-                        for (size_t k_idx = start_k; k_idx < end_k; k_idx++) {
-                            sum += a_data[m * K + k_idx] * b_data[k_idx * N + n];
+                // 加载query块
+                if (read_weight_data(q_buffer,
+                    (i * head_dim + k) * sizeof(float),
+                    block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 加载key块
+                if (read_weight_data(k_buffer,
+                    (j * head_dim + k) * sizeof(float),
+                    block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 计算点积
+                for (size_t b = 0; b < block_size; b++) {
+                    score += q_buffer[b] * k_buffer[b];
+                }
+            }
+            
+            // 应用scale
+            score *= scale;
+            
+            // 保存分数
+            scores[j % ATT_BLOCK_SIZE] = score;
+            
+            // 更新最大分数
+            if (score > max_score) {
+                max_score = score;
+            }
+            
+            // 如果缓冲区满或是最后一个，计算softmax
+            if ((j + 1) % ATT_BLOCK_SIZE == 0 || j == seq_len - 1) {
+                size_t block_size = ((j + 1) % ATT_BLOCK_SIZE) ? 
+                                  ((j + 1) % ATT_BLOCK_SIZE) : ATT_BLOCK_SIZE;
+                
+                // 计算exp并累加
+                for (size_t b = 0; b < block_size; b++) {
+                    scores[b] = expf(scores[b] - max_score);
+                    sum_exp += scores[b];
+                }
+                
+                // 加载value块并计算加权和
+                for (size_t k = 0; k < head_dim; k += ATT_BLOCK_SIZE) {
+                    size_t dim_block_size = (k + ATT_BLOCK_SIZE > head_dim) ?
+                                          (head_dim - k) : ATT_BLOCK_SIZE;
+                    
+                    // 初始化输出缓冲区
+                    memset(v_buffer, 0, dim_block_size * sizeof(float));
+                    
+                    // 对每个value进行加权
+                    for (size_t b = 0; b < block_size; b++) {
+                        size_t v_idx = (j - block_size + b + 1) * head_dim + k;
+                        
+                        // 加载value
+                        if (read_weight_data(v_buffer,
+                            v_idx * sizeof(float),
+                            dim_block_size * sizeof(float)) != 0) {
+                            return -1;
                         }
-                        c_data[m * N + n] += sum;
+                        
+                        // 加权累加
+                        float weight = scores[b] / sum_exp;
+                        for (size_t d = 0; d < dim_block_size; d++) {
+                            v_buffer[d] *= weight;
+                        }
+                        
+                        // 写回结果
+                        if (write_weight_data(v_buffer,
+                            (i * head_dim + k) * sizeof(float),
+                            dim_block_size * sizeof(float)) != 0) {
+                            return -1;
+                        }
                     }
                 }
             }
         }
     }
     
-    return 1;
+    return 0;
 }
 
-// 自注意力计算
-int self_attention(Tensor* query, Tensor* key, Tensor* value, 
-                  Tensor* output, AttentionCache* cache,
-                  MemoryManager* mem_manager) {
-    if (!query || !key || !value || !output || !mem_manager) {
-        set_error("无效的参数");
-        return 0;
+// 激活函数 - GELU
+static float gelu(float x) {
+    // GELU近似实现
+    return 0.5f * x * (1.0f + tanhf(0.797884f * (x + 0.044715f * x * x * x)));
+}
+
+// 流式前馈网络层
+static int stream_ffn(const Tensor* input, const Tensor* weights1, const Tensor* weights2,
+                     const Tensor* bias1, const Tensor* bias2, Tensor* output) {
+    if (!input || !weights1 || !weights2 || !bias1 || !bias2 || !output) return -1;
+    
+    size_t seq_len = input->shape[0];
+    size_t input_dim = input->shape[1];
+    size_t hidden_dim = weights1->shape[1];
+    size_t output_dim = weights2->shape[1];
+    
+    // 验证维度
+    if (weights1->shape[0] != input_dim || weights2->shape[0] != hidden_dim ||
+        bias1->shape[0] != hidden_dim || bias2->shape[0] != output_dim ||
+        output->shape[0] != seq_len || output->shape[1] != output_dim) {
+        return -1;
     }
     
-    // 获取维度
-    size_t seq_len = query->shape[0];
-    size_t num_heads = query->shape[1];
-    size_t head_dim = query->shape[2];
+    // 使用1KB缓冲区
+    #define FFN_BLOCK_SIZE 32
+    float input_buffer[FFN_BLOCK_SIZE];
+    float weight_buffer[FFN_BLOCK_SIZE];
+    float hidden_buffer[FFN_BLOCK_SIZE];
+    float output_buffer[FFN_BLOCK_SIZE];
+    float bias_buffer[FFN_BLOCK_SIZE];
     
-    // 创建临时张量
-    size_t qk_shape[] = {seq_len, seq_len};
-    Tensor* qk_scores = tensor_create(qk_shape, 2, QUANT_NONE);
-    if (!qk_scores) return 0;
-    
-    // 计算注意力分数 Q * K^T
-    if (!matrix_multiply(query, key, qk_scores, mem_manager)) {
-        tensor_free(qk_scores);
-        return 0;
-    }
-    
-    // 缩放注意力分数
-    float scale = 1.0f / sqrtf(head_dim);
-    float* scores_data = (float*)qk_scores->data;
-    for (size_t i = 0; i < seq_len * seq_len; i++) {
-        scores_data[i] *= scale;
-    }
-    
-    // Softmax
+    // 分块计算
     for (size_t i = 0; i < seq_len; i++) {
-        float max_val = scores_data[i * seq_len];
-        for (size_t j = 1; j < seq_len; j++) {
-            if (scores_data[i * seq_len + j] > max_val) {
-                max_val = scores_data[i * seq_len + j];
-            }
-        }
-        
-        float sum = 0.0f;
-        for (size_t j = 0; j < seq_len; j++) {
-            scores_data[i * seq_len + j] = expf(scores_data[i * seq_len + j] - max_val);
-            sum += scores_data[i * seq_len + j];
-        }
-        
-        for (size_t j = 0; j < seq_len; j++) {
-            scores_data[i * seq_len + j] /= sum;
-        }
-    }
-    
-    // 计算注意力输出
-    if (!matrix_multiply(qk_scores, value, output, mem_manager)) {
-        tensor_free(qk_scores);
-        return 0;
-    }
-    
-    // 更新缓存（如果使用）
-    if (cache) {
-        // TODO: 实现KV缓存更新
-    }
-    
-    tensor_free(qk_scores);
-    return 1;
-}
-
-// 模型初始化
-int llm_init(LLMConfig* config, MemoryManager* mem_manager) {
-    if (!config || !mem_manager) {
-        set_error("无效的配置参数");
-        return 0;
-    }
-    
-    g_config = config;
-    g_memory_manager = mem_manager;
-    
-    // 分配全局状态
-    g_state = (LLMState*)malloc(sizeof(LLMState));
-    if (!g_state) {
-        set_error("无法分配全局状态内存");
-        return 0;
-    }
-    
-    // 初始化状态
-    g_state->weights = NULL;
-    g_state->activations = NULL;
-    g_state->cache = NULL;
-    g_state->current_position = 0;
-    g_state->is_initialized = 0;
-    
-    return 1;
-}
-
-// 生成文本
-int llm_generate(const int* prompt_tokens, size_t prompt_length,
-                int* output_tokens, size_t max_length,
-                float temperature, float top_p) {
-    if (!g_state || !g_state->is_initialized) {
-        set_error("模型未初始化");
-        return 0;
-    }
-    
-    // 创建输入张量
-    size_t input_shape[] = {prompt_length, g_config->hidden_size};
-    Tensor* input_embeds = tensor_create(input_shape, 2, QUANT_NONE);
-    if (!input_embeds) return 0;
-    
-    // 词嵌入查找
-    // TODO: 实现词嵌入查找
-    
-    // 主生成循环
-    size_t current_length = prompt_length;
-    while (current_length < max_length) {
-        // 前向传播
-        if (!llm_forward(prompt_tokens, current_length, (float*)input_embeds->data)) {
-            tensor_free(input_embeds);
-            return 0;
-        }
-        
-        // 采样下一个token
-        // TODO: 实现token采样
-        
-        current_length++;
-    }
-    
-    tensor_free(input_embeds);
-    return 1;
-}
-
-// 获取错误信息
-const char* llm_get_error(void) {
-    return g_error_buffer;
-}
-
-// 内存整理
-int llm_memory_defrag(void) {
-    if (!g_memory_manager) {
-        set_error("内存管理器未初始化");
-        return 0;
-    }
-    
-    // TODO: 实现内存整理算法
-    return 1;
-}
-
-// 加载权重
-int llm_load_weights(const char* weights_file) {
-    if (!g_state || !g_config) {
-        set_error("模型未初始化");
-        return 0;
-    }
-    
-    FILE* fp = fopen(weights_file, "rb");
-    if (!fp) {
-        set_error("无法打开权重文件：%s", weights_file);
-        return 0;
-    }
-    
-    // 分配权重数组
-    size_t num_weights = g_config->num_layers * 12;  // 每层12个权重矩阵
-    g_state->weights = (Tensor**)malloc(num_weights * sizeof(Tensor*));
-    if (!g_state->weights) {
-        set_error("无法分配权重数组内存");
-        fclose(fp);
-        return 0;
-    }
-    
-    // 读取权重头信息
-    uint32_t magic;
-    if (fread(&magic, sizeof(uint32_t), 1, fp) != 1 || magic != 0x4D4C4C4D) {  // "MLLM"
-        set_error("无效的权重文件格式");
-        fclose(fp);
-        return 0;
-    }
-    
-    // 读取每个权重矩阵
-    for (size_t i = 0; i < num_weights; i++) {
-        // 读取矩阵维度
-        uint32_t ndim;
-        if (fread(&ndim, sizeof(uint32_t), 1, fp) != 1) {
-            set_error("读取维度信息失败");
-            fclose(fp);
-            return 0;
-        }
-        
-        // 读取形状
-        size_t* shape = (size_t*)malloc(ndim * sizeof(size_t));
-        if (!shape) {
-            set_error("无法分配形状数组内存");
-            fclose(fp);
-            return 0;
-        }
-        
-        for (size_t j = 0; j < ndim; j++) {
-            uint32_t dim;
-            if (fread(&dim, sizeof(uint32_t), 1, fp) != 1) {
-                set_error("读取形状信息失败");
-                free(shape);
-                fclose(fp);
-                return 0;
-            }
-            shape[j] = dim;
-        }
-        
-        // 创建张量
-        g_state->weights[i] = tensor_create(shape, ndim, QUANT_NONE);
-        if (!g_state->weights[i]) {
-            set_error("创建权重张量失败");
-            free(shape);
-            fclose(fp);
-            return 0;
-        }
-        
-        // 读取权重数据
-        size_t data_size = g_state->weights[i]->size * sizeof(float);
-        if (fread(g_state->weights[i]->data, 1, data_size, fp) != data_size) {
-            set_error("读取权重数据失败");
-            free(shape);
-            fclose(fp);
-            return 0;
-        }
-        
-        free(shape);
-        
-        // 量化权重
-        if (g_config->quant_config.quant_type != QUANT_NONE) {
-            if (!tensor_quantize(g_state->weights[i], &g_config->quant_config)) {
-                set_error("权重量化失败");
-                fclose(fp);
-                return 0;
+        // 第一层变换
+        for (size_t j = 0; j < hidden_dim; j += FFN_BLOCK_SIZE) {
+            size_t block_size = (j + FFN_BLOCK_SIZE > hidden_dim) ?
+                               (hidden_dim - j) : FFN_BLOCK_SIZE;
+            
+            // 加载偏置
+            if (read_weight_data(bias_buffer,
+                j * sizeof(float),
+                block_size * sizeof(float)) != 0) {
+                return -1;
             }
             
-            printf("权重 %zu 已量化为 %d 位\n", i, 
-                g_config->quant_config.quant_type == QUANT_INT8 ? 8 :
-                g_config->quant_config.quant_type == QUANT_INT4 ? 4 : 2);
+            // 初始化隐藏状态为偏置
+            memcpy(hidden_buffer, bias_buffer, block_size * sizeof(float));
+            
+            // 计算隐藏状态
+            for (size_t k = 0; k < input_dim; k += FFN_BLOCK_SIZE) {
+                size_t input_block_size = (k + FFN_BLOCK_SIZE > input_dim) ?
+                                        (input_dim - k) : FFN_BLOCK_SIZE;
+                
+                // 加载输入
+                if (read_weight_data(input_buffer,
+                    (i * input_dim + k) * sizeof(float),
+                    input_block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 加载权重
+                if (read_weight_data(weight_buffer,
+                    (k * hidden_dim + j) * sizeof(float),
+                    block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 计算矩阵乘法
+                for (size_t b = 0; b < input_block_size; b++) {
+                    for (size_t h = 0; h < block_size; h++) {
+                        hidden_buffer[h] += input_buffer[b] * weight_buffer[b * block_size + h];
+                    }
+                }
+            }
+            
+            // 应用GELU激活函数
+            for (size_t h = 0; h < block_size; h++) {
+                hidden_buffer[h] = gelu(hidden_buffer[h]);
+            }
+            
+            // 写回隐藏状态
+            if (write_weight_data(hidden_buffer,
+                (i * hidden_dim + j) * sizeof(float),
+                block_size * sizeof(float)) != 0) {
+                return -1;
+            }
+        }
+        
+        // 第二层变换
+        for (size_t j = 0; j < output_dim; j += FFN_BLOCK_SIZE) {
+            size_t block_size = (j + FFN_BLOCK_SIZE > output_dim) ?
+                               (output_dim - j) : FFN_BLOCK_SIZE;
+            
+            // 加载偏置
+            if (read_weight_data(bias_buffer,
+                j * sizeof(float),
+                block_size * sizeof(float)) != 0) {
+                return -1;
+            }
+            
+            // 初始化输出为偏置
+            memcpy(output_buffer, bias_buffer, block_size * sizeof(float));
+            
+            // 计算输出
+            for (size_t k = 0; k < hidden_dim; k += FFN_BLOCK_SIZE) {
+                size_t hidden_block_size = (k + FFN_BLOCK_SIZE > hidden_dim) ?
+                                         (hidden_dim - k) : FFN_BLOCK_SIZE;
+                
+                // 加载隐藏状态
+                if (read_weight_data(hidden_buffer,
+                    (i * hidden_dim + k) * sizeof(float),
+                    hidden_block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 加载权重
+                if (read_weight_data(weight_buffer,
+                    (k * output_dim + j) * sizeof(float),
+                    block_size * sizeof(float)) != 0) {
+                    return -1;
+                }
+                
+                // 计算矩阵乘法
+                for (size_t h = 0; h < hidden_block_size; h++) {
+                    for (size_t o = 0; o < block_size; o++) {
+                        output_buffer[o] += hidden_buffer[h] * weight_buffer[h * block_size + o];
+                    }
+                }
+            }
+            
+            // 写回输出
+            if (write_weight_data(output_buffer,
+                (i * output_dim + j) * sizeof(float),
+                block_size * sizeof(float)) != 0) {
+                return -1;
+            }
         }
     }
     
-    fclose(fp);
-    
-    // 创建激活值张量
-    size_t act_shape[] = {g_config->batch_size, g_config->max_seq_length, g_config->hidden_size};
-    g_state->activations = tensor_create(act_shape, 3, QUANT_NONE);
-    if (!g_state->activations) {
-        set_error("创建激活值张量失败");
-        return 0;
-    }
-    
-    // 如果使用KV缓存，创建缓存
-    if (g_config->use_cache) {
-        g_state->cache = (AttentionCache*)malloc(sizeof(AttentionCache));
-        if (!g_state->cache) {
-            set_error("创建注意力缓存失败");
-            return 0;
-        }
-        
-        size_t cache_shape[] = {
-            g_config->batch_size,
-            g_config->num_layers,
-            g_config->max_seq_length,
-            g_config->hidden_size
-        };
-        
-        g_state->cache->key_cache = tensor_create(cache_shape, 4, QUANT_NONE);
-        g_state->cache->value_cache = tensor_create(cache_shape, 4, QUANT_NONE);
-        
-        if (!g_state->cache->key_cache || !g_state->cache->value_cache) {
-            set_error("创建KV缓存张量失败");
-            return 0;
-        }
-        
-        g_state->cache->current_length = 0;
-    }
-    
-    g_state->is_initialized = 1;
-    printf("模型加载完成，使用 %s 量化\n",
-        g_config->quant_config.quant_type == QUANT_NONE ? "无" :
-        g_config->quant_config.quant_type == QUANT_INT8 ? "INT8" :
-        g_config->quant_config.quant_type == QUANT_INT4 ? "INT4" : "INT2");
-    
-    return 1;
+    return 0;
 }
 
-// 前向传播
+// 初始化推理环境
+int llm_init(LLMConfig* config, MemoryManager* mem_manager) {
+    if (!config || !mem_manager) return -1;
+    
+    // 初始化控制台编码
+    init_console_encoding();
+    
+    // 初始化权重缓存系统
+    init_weight_cache();
+    
+    print_utf8("正在初始化模型...\n");
+    
+    // 初始化模型状态
+    g_model_state = (LLMState*)calloc(1, sizeof(LLMState));
+    if (!g_model_state) return -1;
+    
+    // 复制配置
+    memcpy(&g_model_state->config, config, sizeof(LLMConfig));
+    
+    // 初始化激活值
+    g_model_state->activations.data = NULL;
+    g_model_state->activations.ndim = 2;
+    g_model_state->activations.shape[0] = 1;
+    g_model_state->activations.shape[1] = config->hidden_size;
+    g_model_state->activations.quant_type = QUANT_NONE;
+    
+    g_model_state->is_initialized = 1;
+    return 0;
+}
+
+// 主推理函数
 int llm_forward(const int* input_tokens, size_t input_length, float* output) {
-    if (!g_state || !g_state->is_initialized) {
-        set_error("模型未初始化");
-        return 0;
+    if (!g_model_state || !input_tokens || !output) {
+        print_utf8("错误：模型未初始化或参数无效\n");
+        return -1;
     }
     
-    // TODO: 实现前向传播
-    return 1;
+    print_utf8("开始推理计算...\n");
+    
+    // 分配临时缓冲区
+    float* temp_buffer = malloc(g_model_state->config.hidden_size * sizeof(float));
+    if (!temp_buffer) {
+        print_utf8("错误：内存分配失败\n");
+        return -1;
+    }
+    
+    // 分配激活值缓冲区（如果未初始化）
+    if (!g_model_state->activations.data) {
+        g_model_state->activations.data = malloc(g_model_state->config.hidden_size * sizeof(float));
+        if (!g_model_state->activations.data) {
+            free(temp_buffer);
+            return -1;
+        }
+    }
+    
+    for (size_t pos = 0; pos < input_length; pos++) {
+        // 更新当前位置
+        g_model_state->current_position = pos;
+        
+        // 1. 词嵌入层
+        size_t token_offset = (size_t)input_tokens[pos] * g_model_state->config.hidden_size;
+        if (read_weight_data(g_model_state->activations.data,
+                           token_offset * sizeof(float),
+                           g_model_state->config.hidden_size * sizeof(float)) != 0) {
+            free(temp_buffer);
+            return -1;
+        }
+        
+        // 2. Transformer层循环
+        for (size_t layer = 0; layer < g_model_state->config.num_layers; layer++) {
+            TransformerWeights* layer_weights = &g_model_state->weights[layer];
+            
+            // 2.1 自注意力层
+            float* query = malloc(g_model_state->config.hidden_size * sizeof(float));
+            float* key = malloc(g_model_state->config.hidden_size * sizeof(float));
+            float* value = malloc(g_model_state->config.hidden_size * sizeof(float));
+            
+            if (!query || !key || !value) {
+                if (query) free(query);
+                if (key) free(key);
+                if (value) free(value);
+                free(temp_buffer);
+                return -1;
+            }
+            
+            // QKV投影
+            matrix_multiply(g_model_state->activations.data,
+                          layer_weights->query_weight.data,
+                          query,
+                          1,
+                          g_model_state->config.hidden_size,
+                          g_model_state->config.hidden_size);
+                          
+            matrix_multiply(g_model_state->activations.data,
+                          layer_weights->key_weight.data,
+                          key,
+                          1,
+                          g_model_state->config.hidden_size,
+                          g_model_state->config.hidden_size);
+                          
+            matrix_multiply(g_model_state->activations.data,
+                          layer_weights->value_weight.data,
+                          value,
+                          1,
+                          g_model_state->config.hidden_size,
+                          g_model_state->config.hidden_size);
+            
+            // 更新KV缓存
+            if (g_model_state->cache) {
+                size_t cache_offset = pos * g_model_state->config.hidden_size;
+                float* key_cache_ptr = g_model_state->cache->key_cache + cache_offset;
+                float* value_cache_ptr = g_model_state->cache->value_cache + cache_offset;
+                memcpy(key_cache_ptr, key, g_model_state->config.hidden_size * sizeof(float));
+                memcpy(value_cache_ptr, value, g_model_state->config.hidden_size * sizeof(float));
+            }
+            
+            // 注意力计算
+            float scale = 1.0f / sqrtf((float)g_model_state->config.hidden_size);
+            size_t head_dim = g_model_state->config.hidden_size / g_model_state->config.num_heads;
+            
+            if (g_model_state->cache) {
+                attention_forward(query,
+                               g_model_state->cache->key_cache,
+                               g_model_state->cache->value_cache,
+                               temp_buffer,
+                               pos + 1,
+                               head_dim,
+                               scale);
+            } else {
+                attention_forward(query, key, value, temp_buffer,
+                               1,
+                               head_dim,
+                               scale);
+            }
+            
+            // 2.2 前馈网络
+            ffn_forward(temp_buffer,
+                       layer_weights->ffn_weight1.data,
+                       layer_weights->ffn_weight2.data,
+                       layer_weights->ffn_bias1.data,
+                       layer_weights->ffn_bias2.data,
+                       g_model_state->activations.data,
+                       g_model_state->config.hidden_size,
+                       g_model_state->config.ffn_hidden_size);
+            
+            // 清理临时内存
+            free(query);
+            free(key);
+            free(value);
+        }
+        
+        // 3. 输出层
+        size_t output_offset = pos * g_model_state->config.hidden_size;
+        memcpy(&output[output_offset],
+               g_model_state->activations.data,
+               g_model_state->config.hidden_size * sizeof(float));
+    }
+    
+    free(temp_buffer);
+    return 0;
 }
 
-// 清理资源
+// 清理函数
 void llm_cleanup(void) {
-    if (g_state) {
-        if (g_state->weights) {
-            // 释放权重
-            for (size_t i = 0; i < g_config->num_layers * 12; i++) {  // 12是每层的权重矩阵数量
-                tensor_free(g_state->weights[i]);
-            }
-            free(g_state->weights);
+    if (!g_model_state) return;
+    
+    print_utf8("正在清理资源...\n");
+    
+    // 清理权重缓存
+    for (size_t i = 0; i < g_weight_cache.active_pages; i++) {
+        if (g_weight_cache.pages[i].is_dirty) {
+            write_page_to_swap(&g_weight_cache.pages[i]);
         }
-        
-        // 释放激活值
-        if (g_state->activations) {
-            tensor_free(g_state->activations);
+        if (g_weight_cache.pages[i].data) {
+            free(g_weight_cache.pages[i].data);
         }
-        
-        // 释放KV缓存
-        if (g_state->cache) {
-            if (g_state->cache->key_cache) {
-                tensor_free(g_state->cache->key_cache);
-            }
-            if (g_state->cache->value_cache) {
-                tensor_free(g_state->cache->value_cache);
-            }
-            free(g_state->cache);
-        }
-        
-        free(g_state);
-        g_state = NULL;
     }
     
-    g_config = NULL;
-    g_memory_manager = NULL;
+    // 删除所有交换文件
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = FindFirstFile(CACHE_DIR "/*.*", &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", CACHE_DIR, fd.cFileName);
+            DeleteFile(path);
+        } while (FindNextFile(hFind, &fd));
+        FindClose(hFind);
+    }
+    _rmdir(CACHE_DIR);
+    
+    // 清理模型状态
+    if (g_model_state->activations.data) {
+        free(g_model_state->activations.data);
+    }
+    
+    free(g_model_state);
+    g_model_state = NULL;
+    
+    print_utf8("清理完成\n");
 } 

@@ -1,0 +1,3 @@
+C:\msys64\mingw64\bin\cmake.exe -E rm -f CMakeFiles\test_download.dir/objects.a
+C:\msys64\mingw64\bin\ar.exe qc CMakeFiles\test_download.dir/objects.a @CMakeFiles\test_download.dir\objects1.rsp
+C:\msys64\mingw64\bin\gcc.exe -g -Wl,--whole-archive CMakeFiles\test_download.dir/objects.a -Wl,--no-whole-archive -o ..\bin\test_download.exe -Wl,--out-implib,libtest_download.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\test_download.dir\linkLibs.rsp

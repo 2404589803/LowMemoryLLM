@@ -1,0 +1,2 @@
+C:\msys64\mingw64\bin\ar.exe qc liblow_memory_llm.a CMakeFiles/low_memory_llm.dir/src/download.c.obj CMakeFiles/low_memory_llm.dir/src/extreme_compress.c.obj CMakeFiles/low_memory_llm.dir/src/tensor.c.obj CMakeFiles/low_memory_llm.dir/src/inference.c.obj
+C:\msys64\mingw64\bin\ranlib.exe liblow_memory_llm.a
