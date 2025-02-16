@@ -132,7 +132,26 @@ void device_manager_cleanup(void) {
             if (g_device_manager->devices[i]) {
                 // 释放设备特定资源
                 if (g_device_manager->devices[i]->device_type == DEVICE_TYPE_GPU) {
-                    // TODO: 释放GPU资源
+                    // 释放GPU内存
+                    if (g_device_manager->devices[i]->allocate_memory) {
+                        void* gpu_memory = g_device_manager->devices[i]->device_specific_data;
+                        if (gpu_memory) {
+                            g_device_manager->devices[i]->free_memory(gpu_memory);
+                        }
+                    }
+                    
+                    // 释放GPU上下文
+                    if (g_device_manager->devices[i]->device_specific_data) {
+                        // 假设device_specific_data指向GPU上下文结构
+                        GPUContext* ctx = (GPUContext*)g_device_manager->devices[i]->device_specific_data;
+                        if (ctx->command_queue) {
+                            clReleaseCommandQueue(ctx->command_queue);
+                        }
+                        if (ctx->context) {
+                            clReleaseContext(ctx->context);
+                        }
+                        free(ctx);
+                    }
                 }
             }
         }

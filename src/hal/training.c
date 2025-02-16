@@ -111,6 +111,36 @@ static void optimizer_step(void* params, void* grads, void* state,
     }
 }
 
+// 前向传播
+static int forward_pass(void* model, void* inputs, void* predictions,
+                       size_t batch_size, TrainingCallbacks* callbacks) {
+    if (!model || !inputs || !predictions) return -1;
+    
+    // 获取模型参数
+    float* weights = (float*)model;
+    float* input_data = (float*)inputs;
+    float* output_data = (float*)predictions;
+    
+    // 分配中间结果缓冲区
+    void* layer_output = g_device->allocate_memory(batch_size * sizeof(float));
+    if (!layer_output) return -1;
+    
+    // 线性层前向传播
+    g_extension->forward_matrix_multiply(weights, input_data, layer_output,
+                                       batch_size, g_config->hidden_size,
+                                       g_config->input_size);
+    
+    // 应用激活函数
+    g_extension->forward_activation(output_data, layer_output,
+                                  batch_size * g_config->hidden_size,
+                                  "relu");
+    
+    // 释放中间缓冲区
+    g_device->free_memory(layer_output);
+    
+    return 0;
+}
+
 // 训练一个批次
 int training_step(void* model, void* inputs, void* targets,
                  TrainingState* state, TrainingCallbacks* callbacks) {
@@ -126,7 +156,10 @@ int training_step(void* model, void* inputs, void* targets,
     void* predictions = g_device->allocate_memory(g_config->batch_size * sizeof(float));
     if (!predictions) return -1;
     
-    // TODO: 实现前向传播
+    if (forward_pass(model, inputs, predictions, g_config->batch_size, callbacks) != 0) {
+        g_device->free_memory(predictions);
+        return -1;
+    }
     
     // 计算损失
     state->current_loss = g_extension->compute_loss(predictions, targets,

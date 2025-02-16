@@ -82,23 +82,49 @@ vector_add_asm:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     
-    // 初始化循环计数器
-    mov x4, xzr         // index = 0
+    // 保存NEON寄存器
+    stp d8, d9, [sp, #-16]!
     
+    // 计算向量块数（每块4个float）
+    lsr x4, x3, #2        // size / 4
+    
+    // 主循环 - 每次处理4个float
 .loop:
-    // 加载数据
-    ld1 {v0.4s}, [x0], #16    // 加载a的4个float，并更新指针
-    ld1 {v1.4s}, [x1], #16    // 加载b的4个float，并更新指针
+    cbz x4, .remainder
     
-    // 向量加法
+    // 加载数据
+    ld1 {v0.4s}, [x0], #16    // 加载a的4个float
+    ld1 {v1.4s}, [x1], #16    // 加载b的4个float
+    
+    // 执行向量加法
     fadd v2.4s, v0.4s, v1.4s
     
     // 存储结果
-    st1 {v2.4s}, [x2], #16    // 存储结果，并更新指针
+    st1 {v2.4s}, [x2], #16
     
-    add x4, x4, #4            // index += 4
-    cmp x4, x3                // index < size?
-    b.lt .loop
+    // 更新计数器
+    sub x4, x4, #1
+    cbnz x4, .loop
+    
+.remainder:
+    // 处理剩余的元素
+    and x4, x3, #3        // size % 4
+    cbz x4, .done
+    
+.remainder_loop:
+    // 单个元素加法
+    ldr s0, [x0], #4
+    ldr s1, [x1], #4
+    fadd s2, s0, s1
+    str s2, [x2], #4
+    
+    // 更新计数器
+    sub x4, x4, #1
+    cbnz x4, .remainder_loop
+    
+.done:
+    // 恢复NEON寄存器
+    ldp d8, d9, [sp], #16
     
     // 恢复寄存器
     ldp x29, x30, [sp], #16
