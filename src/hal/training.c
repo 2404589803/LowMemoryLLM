@@ -182,24 +182,63 @@ int training_step(void* model, void* inputs, void* targets,
                              g_config->batch_size, g_config->loss_type);
     
     // TODO: 实现反向传播
+    // 分配梯度缓冲区
+    void* grad_weights = g_device->allocate_memory(g_config->batch_size * g_config->hidden_size * g_config->input_size * sizeof(float));
+    if (!grad_weights) {
+        g_device->free_memory(predictions);
+        g_device->free_memory(grad_output);
+        return -1;
+    }
+    
+    // 获取原始输入和权重
+    float* weights = (float*)model;
+    float* input_data = (float*)inputs;
+    
+    // 执行反向传播 - 计算激活函数梯度
+    void* d_layer_output = g_device->allocate_memory(g_config->batch_size * g_config->hidden_size * sizeof(float));
+    if (!d_layer_output) {
+        g_device->free_memory(predictions);
+        g_device->free_memory(grad_output);
+        g_device->free_memory(grad_weights);
+        return -1;
+    }
+    
+    // 计算激活函数的梯度
+    g_extension->backward_activation(grad_output, predictions, d_layer_output,
+                                   g_config->batch_size * g_config->hidden_size,
+                                   "relu");
+    
+    // 计算权重梯度
+    g_extension->backward_matrix_multiply(
+        d_layer_output,             // 梯度输入
+        input_data,                 // 前向输入
+        weights,                    // 权重
+        grad_weights,               // 权重梯度
+        g_config->batch_size,       // 批次大小
+        g_config->hidden_size,      // 输出维度
+        g_config->input_size        // 输入维度
+    );
     
     // 梯度裁剪
     if (g_config->gradient_clip_norm > 0) {
-        g_extension->clip_gradients(grad_output, g_config->batch_size,
+        g_extension->clip_gradients(grad_weights, 
+                                  g_config->batch_size * g_config->hidden_size * g_config->input_size,
                                   g_config->gradient_clip_norm);
     }
     
     // 优化器步骤
-    optimizer_step(model, grad_output, state->optimizer_state,
-                  g_config->batch_size * sizeof(float));
+    optimizer_step(model, grad_weights, state->optimizer_state,
+                  g_config->batch_size * g_config->hidden_size * g_config->input_size * sizeof(float));
+    
+    // 清理
+    g_device->free_memory(grad_weights);
+    g_device->free_memory(d_layer_output);
+    g_device->free_memory(predictions);
+    g_device->free_memory(grad_output);
     
     if (callbacks && callbacks->on_backward_end) {
         callbacks->on_backward_end(state);
     }
-    
-    // 清理
-    g_device->free_memory(predictions);
-    g_device->free_memory(grad_output);
     
     if (callbacks && callbacks->on_batch_end) {
         callbacks->on_batch_end(state);
@@ -219,6 +258,11 @@ int training_evaluate(void* model, void* inputs, void* targets,
     if (!predictions) return -1;
     
     // TODO: 实现前向传播进行评估
+    // 使用已有的前向传播函数评估模型
+    if (forward_pass(model, inputs, predictions, g_config->batch_size, NULL) != 0) {
+        g_device->free_memory(predictions);
+        return -1;
+    }
     
     // 计算评估指标
     metrics[0] = g_extension->compute_loss(predictions, targets,
@@ -226,6 +270,22 @@ int training_evaluate(void* model, void* inputs, void* targets,
                                          g_config->loss_type);
     
     // TODO: 计算其他评估指标
+    if (num_metrics > 1) {
+        // 计算准确率 (针对分类任务)
+        float* pred_data = (float*)predictions;
+        float* target_data = (float*)targets;
+        size_t correct = 0;
+        
+        for (size_t i = 0; i < g_config->batch_size; i++) {
+            // 对于二分类问题，预测值大于0.5视为正例
+            if ((pred_data[i] > 0.5f && target_data[i] > 0.5f) || 
+                (pred_data[i] <= 0.5f && target_data[i] <= 0.5f)) {
+                correct++;
+            }
+        }
+        
+        metrics[1] = (float)correct / g_config->batch_size;
+    }
     
     g_device->free_memory(predictions);
     return 0;

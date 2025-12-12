@@ -7,6 +7,18 @@ extern void matrix_multiply_asm(const float* a, const float* b, float* c,
                               size_t m, size_t n, size_t k);
 extern void vector_add_asm(const float* a, const float* b, float* c, size_t size);
 
+// GPU设备函数声明
+extern void* gpu_allocate_memory(size_t size);
+extern void gpu_free_memory(void* ptr);
+extern void gpu_memcpy_to_device(void* dst, const void* src, size_t size);
+extern void gpu_memcpy_from_device(void* dst, const void* src, size_t size);
+extern void gpu_matrix_multiply(const void* a, const void* b, void* c,
+                              size_t m, size_t n, size_t k);
+extern void gpu_vector_add(const void* a, const void* b, void* c, size_t size);
+extern int gpu_get_device_count(void);
+extern size_t gpu_get_memory_size(int device_index);
+extern int gpu_get_compute_capability(int device_index);
+
 // 静态设备列表
 static HAL_Device* devices = NULL;
 static int num_devices = 0;
@@ -44,6 +56,7 @@ static HAL_Device* init_cpu_device(void) {
     if (!dev) return NULL;
     
     dev->device_type = DEVICE_TYPE_CPU;
+    dev->device_index = 0;  // CPU设备索引设为0
     
     // 获取CPU信息
 #ifdef _WIN32
@@ -68,13 +81,41 @@ static HAL_Device* init_cpu_device(void) {
     return dev;
 }
 
+// 初始化GPU设备
+static HAL_Device* init_gpu_device(int device_index) {
+    HAL_Device* dev = (HAL_Device*)malloc(sizeof(HAL_Device));
+    if (!dev) return NULL;
+    
+    dev->device_type = DEVICE_TYPE_GPU;
+    
+    // 获取GPU信息
+    dev->device_index = device_index;
+    dev->capabilities.compute_units = 0;  // 这将由具体实现填充
+    dev->capabilities.memory_size = gpu_get_memory_size(device_index);
+    dev->capabilities.max_threads = 1024;  // 典型的GPU线程块大小
+    
+    // 设置函数指针
+    dev->allocate_memory = gpu_allocate_memory;
+    dev->free_memory = gpu_free_memory;
+    dev->memcpy_to_device = gpu_memcpy_to_device;
+    dev->memcpy_from_device = gpu_memcpy_from_device;
+    dev->matrix_multiply = gpu_matrix_multiply;
+    dev->vector_add = gpu_vector_add;
+    
+    return dev;
+}
+
 // HAL系统初始化
 int hal_init(void) {
     // 初始化CPU设备
     HAL_Device* cpu_dev = init_cpu_device();
     if (!cpu_dev) return -1;
     
-    devices = (HAL_Device**)malloc(sizeof(HAL_Device*));
+    // 统计设备总数（至少有一个CPU设备）
+    int gpu_count = gpu_get_device_count();
+    int total_devices = 1 + (gpu_count > 0 ? gpu_count : 0);
+    
+    devices = (HAL_Device**)malloc(sizeof(HAL_Device*) * total_devices);
     if (!devices) {
         free(cpu_dev);
         return -1;
@@ -84,6 +125,13 @@ int hal_init(void) {
     num_devices = 1;
     
     // TODO: 初始化其他设备（GPU等）
+    // 初始化GPU设备
+    for (int i = 0; i < gpu_count; i++) {
+        HAL_Device* gpu_dev = init_gpu_device(i);
+        if (gpu_dev) {
+            devices[num_devices++] = gpu_dev;
+        }
+    }
     
     return 0;
 }

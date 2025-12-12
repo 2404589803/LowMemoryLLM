@@ -14,6 +14,9 @@ typedef struct {
         DEVICE_TYPE_OTHER
     } device_type;
     
+    // 设备索引（针对多GPU系统）
+    int device_index;
+    
     // 设备能力描述
     struct {
         uint32_t compute_units;

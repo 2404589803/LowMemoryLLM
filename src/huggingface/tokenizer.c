@@ -24,6 +24,12 @@ typedef struct {
     int priority;
 } BPEMerge;
 
+// BPE合并规则表
+typedef struct {
+    BPEMerge* merges;
+    size_t num_merges;
+} BPEMergeTable;
+
 // 创建词汇表哈希表
 static VocabHashTable* create_vocab_table(size_t capacity) {
     VocabHashTable* table = (VocabHashTable*)malloc(sizeof(VocabHashTable));
@@ -158,6 +164,67 @@ static int load_vocab_file(VocabHashTable* table, const char* vocab_file) {
     return 0;
 }
 
+// 加载BPE合并规则
+static void* load_bpe_merges(const char* merges_file) {
+    FILE* fp = fopen(merges_file, "r");
+    if (!fp) return NULL;
+    
+    // 先数一遍行数以确定数组大小
+    char line[1024];
+    size_t num_merges = 0;
+    
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        // 跳过版本行和空行
+        if (line[0] == '#' || line[0] == '\n') continue;
+        num_merges++;
+    }
+    
+    // 分配合并规则数组
+    BPEMerge* merges = (BPEMerge*)malloc(sizeof(BPEMerge) * num_merges);
+    if (!merges) {
+        fclose(fp);
+        return NULL;
+    }
+    
+    // 重新从文件开始读取
+    rewind(fp);
+    size_t idx = 0;
+    
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        // 跳过版本行和空行
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        // 移除换行符
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') {
+            line[len-1] = '\0';
+            len--;
+        }
+        
+        // 复制合并对
+        merges[idx].pair = strdup(line);
+        merges[idx].priority = idx;  // 优先级按文件中的顺序
+        idx++;
+    }
+    
+    fclose(fp);
+    
+    // 创建BPE合并规则结构
+    BPEMergeTable* table = (BPEMergeTable*)malloc(sizeof(BPEMergeTable));
+    if (!table) {
+        for (size_t i = 0; i < num_merges; i++) {
+            free(merges[i].pair);
+        }
+        free(merges);
+        return NULL;
+    }
+    
+    table->merges = merges;
+    table->num_merges = num_merges;
+    
+    return table;
+}
+
 // 初始化分词器
 int tokenizer_init(Tokenizer** tokenizer, const TokenizerConfig* config) {
     if (!tokenizer || !config || !config->vocab_file) return -1;
@@ -196,7 +263,13 @@ int tokenizer_init(Tokenizer** tokenizer, const TokenizerConfig* config) {
     
     // 加载BPE合并规则（如果需要）
     if (config->type == TOKENIZER_BPE && config->merges_file) {
-        // TODO: 实现BPE合并规则加载
+        (*tokenizer)->merges = load_bpe_merges(config->merges_file);
+        if (!(*tokenizer)->merges) {
+            tokenizer_free(*tokenizer);
+            return -1;
+        }
+    } else {
+        (*tokenizer)->merges = NULL;
     }
     
     (*tokenizer)->vocab_size = ((VocabHashTable*)(*tokenizer)->vocab)->size;
@@ -231,10 +304,115 @@ void tokenizer_free(Tokenizer* tokenizer) {
     
     // 释放BPE合并规则
     if (tokenizer->merges) {
-        // TODO: 实现BPE合并规则释放
+        BPEMergeTable* merges_table = (BPEMergeTable*)tokenizer->merges;
+        for (size_t i = 0; i < merges_table->num_merges; i++) {
+            free(merges_table->merges[i].pair);
+        }
+        free(merges_table->merges);
     }
     
     free(tokenizer);
+}
+
+// 定义一些BPE分词相关的辅助函数
+static char** split_into_chars(const char* text, size_t* num_chars) {
+    size_t text_len = strlen(text);
+    char** chars = (char**)malloc(sizeof(char*) * text_len);
+    if (!chars) return NULL;
+    
+    *num_chars = 0;
+    
+    for (size_t i = 0; i < text_len; ) {
+        size_t char_len = 1;
+        // 处理UTF-8多字节字符
+        if ((text[i] & 0xE0) == 0xC0) char_len = 2;
+        else if ((text[i] & 0xF0) == 0xE0) char_len = 3;
+        else if ((text[i] & 0xF8) == 0xF0) char_len = 4;
+        
+        // 确保不会超出文本边界
+        if (i + char_len > text_len) break;
+        
+        chars[*num_chars] = (char*)malloc(char_len + 1);
+        if (!chars[*num_chars]) {
+            for (size_t j = 0; j < *num_chars; j++) {
+                free(chars[j]);
+            }
+            free(chars);
+            return NULL;
+        }
+        
+        memcpy(chars[*num_chars], text + i, char_len);
+        chars[*num_chars][char_len] = '\0';
+        (*num_chars)++;
+        
+        i += char_len;
+    }
+    
+    return chars;
+}
+
+static void free_chars(char** chars, size_t num_chars) {
+    for (size_t i = 0; i < num_chars; i++) {
+        free(chars[i]);
+    }
+    free(chars);
+}
+
+static char* join_chars(char** chars, size_t start, size_t end) {
+    if (start >= end) return NULL;
+    
+    // 计算需要的总长度
+    size_t total_len = 0;
+    for (size_t i = start; i < end; i++) {
+        total_len += strlen(chars[i]);
+    }
+    
+    char* result = (char*)malloc(total_len + 1);
+    if (!result) return NULL;
+    
+    // 合并字符
+    size_t offset = 0;
+    for (size_t i = start; i < end; i++) {
+        size_t len = strlen(chars[i]);
+        memcpy(result + offset, chars[i], len);
+        offset += len;
+    }
+    
+    result[total_len] = '\0';
+    return result;
+}
+
+static int find_best_merge(char** parts, size_t num_parts, BPEMergeTable* merges, size_t* best_i, size_t* best_j) {
+    int best_priority = -1;
+    *best_i = 0;
+    *best_j = 0;
+    
+    // 检查所有相邻对
+    for (size_t i = 0; i < num_parts - 1; i++) {
+        // 构建合并对作为查询
+        size_t len1 = strlen(parts[i]);
+        size_t len2 = strlen(parts[i + 1]);
+        char* pair = (char*)malloc(len1 + len2 + 2);
+        if (!pair) return -1;
+        
+        sprintf(pair, "%s %s", parts[i], parts[i + 1]);
+        
+        // 在合并规则中查找
+        for (size_t j = 0; j < merges->num_merges; j++) {
+            if (strcmp(pair, merges->merges[j].pair) == 0) {
+                if (best_priority == -1 || merges->merges[j].priority < best_priority) {
+                    best_priority = merges->merges[j].priority;
+                    *best_i = i;
+                    *best_j = i + 1;
+                }
+                break;
+            }
+        }
+        
+        free(pair);
+    }
+    
+    return best_priority;
 }
 
 // 编码文本
@@ -259,6 +437,76 @@ int tokenizer_encode(Tokenizer* tokenizer,
     switch (tokenizer->config.type) {
         case TOKENIZER_BPE:
             // TODO: 实现BPE分词
+            {
+                // 1. 将文本分割成单个字符
+                size_t num_chars;
+                char** chars = split_into_chars(text, &num_chars);
+                if (!chars) return -1;
+                
+                // 初始子词为单个字符
+                char** parts = (char**)malloc(sizeof(char*) * num_chars);
+                if (!parts) {
+                    free_chars(chars, num_chars);
+                    return -1;
+                }
+                
+                size_t num_parts = num_chars;
+                for (size_t i = 0; i < num_chars; i++) {
+                    parts[i] = strdup(chars[i]);
+                }
+                
+                // 释放原始字符数组
+                free_chars(chars, num_chars);
+                
+                // 获取BPE合并规则
+                BPEMergeTable* merges = (BPEMergeTable*)tokenizer->merges;
+                if (merges) {
+                    // 2. 迭代应用BPE合并规则
+                    while (num_parts > 1) {
+                        size_t best_i, best_j;
+                        int priority = find_best_merge(parts, num_parts, merges, &best_i, &best_j);
+                        
+                        if (priority == -1) break;  // 没有找到适用的合并规则
+                        
+                        // 合并选中的对
+                        char* merged = (char*)malloc(strlen(parts[best_i]) + strlen(parts[best_j]) + 1);
+                        if (!merged) break;
+                        
+                        strcpy(merged, parts[best_i]);
+                        strcat(merged, parts[best_j]);
+                        
+                        free(parts[best_i]);
+                        free(parts[best_j]);
+                        
+                        // 更新parts数组
+                        parts[best_i] = merged;
+                        for (size_t i = best_j + 1; i < num_parts; i++) {
+                            parts[i - 1] = parts[i];
+                        }
+                        num_parts--;
+                    }
+                }
+                
+                // 3. 将合并后的部分转换为令牌ID
+                for (size_t i = 0; i < num_parts && *num_tokens < max_length; i++) {
+                    int32_t id = tokenizer_token_to_id(tokenizer, parts[i]);
+                    if (id >= 0) {
+                        tokens[(*num_tokens)++] = id;
+                    } else if (tokenizer->config.unk_token) {
+                        // 使用未知令牌
+                        id = tokenizer_token_to_id(tokenizer, tokenizer->config.unk_token);
+                        if (id >= 0) {
+                            tokens[(*num_tokens)++] = id;
+                        }
+                    }
+                }
+                
+                // 清理
+                for (size_t i = 0; i < num_parts; i++) {
+                    free(parts[i]);
+                }
+                free(parts);
+            }
             break;
             
         case TOKENIZER_WORDPIECE:
@@ -285,10 +533,122 @@ int tokenizer_encode(Tokenizer* tokenizer,
             
         case TOKENIZER_UNIGRAM:
             // TODO: 实现Unigram分词
+            {
+                // Unigram分词器（简化版本）
+                // 这是一个贪婪搜索的简单实现，完整实现应该使用Viterbi算法
+                
+                // 将文本转换为UTF-8字符
+                size_t num_chars;
+                char** chars = split_into_chars(text, &num_chars);
+                if (!chars) return -1;
+                
+                // 尝试从每个起始位置开始寻找最长匹配
+                size_t pos = 0;
+                while (pos < num_chars && *num_tokens < max_length) {
+                    int32_t best_id = -1;
+                    size_t best_len = 0;
+                    
+                    // 从当前位置尝试不同长度的子串
+                    for (size_t len = 1; len <= num_chars - pos; len++) {
+                        char* substr = join_chars(chars, pos, pos + len);
+                        if (!substr) continue;
+                        
+                        int32_t id = tokenizer_token_to_id(tokenizer, substr);
+                        if (id >= 0 && len > best_len) {
+                            best_id = id;
+                            best_len = len;
+                        }
+                        
+                        free(substr);
+                    }
+                    
+                    // 如果找到匹配项，添加到结果
+                    if (best_id >= 0) {
+                        tokens[(*num_tokens)++] = best_id;
+                        pos += best_len;
+                    } else {
+                        // 没有找到匹配，使用未知令牌并前进一个字符
+                        if (tokenizer->config.unk_token) {
+                            int32_t unk_id = tokenizer_token_to_id(tokenizer, tokenizer->config.unk_token);
+                            if (unk_id >= 0) {
+                                tokens[(*num_tokens)++] = unk_id;
+                            }
+                        }
+                        pos++;
+                    }
+                }
+                
+                // 清理
+                free_chars(chars, num_chars);
+            }
             break;
             
         case TOKENIZER_SENTENCEPIECE:
             // TODO: 实现SentencePiece分词
+            {
+                // SentencePiece分词器（简化版本）
+                // SentencePiece通常可以使用BPE或Unigram算法，这里我们使用
+                // 类似Unigram的贪婪搜索算法，但增加了SentencePiece的特殊处理
+                
+                // 预处理：增加开始标记（如果未提供特殊token则使用空格）
+                char* preprocessed_text;
+                if (tokenizer->config.add_prefix_space) {
+                    preprocessed_text = (char*)malloc(strlen(text) + 2);
+                    if (!preprocessed_text) return -1;
+                    preprocessed_text[0] = ' ';
+                    strcpy(preprocessed_text + 1, text);
+                } else {
+                    preprocessed_text = strdup(text);
+                    if (!preprocessed_text) return -1;
+                }
+                
+                // 将文本转换为UTF-8字符
+                size_t num_chars;
+                char** chars = split_into_chars(preprocessed_text, &num_chars);
+                free(preprocessed_text);
+                if (!chars) return -1;
+                
+                // 尝试从每个起始位置开始寻找最长匹配
+                size_t pos = 0;
+                while (pos < num_chars && *num_tokens < max_length) {
+                    int32_t best_id = -1;
+                    size_t best_len = 0;
+                    
+                    // 从当前位置尝试不同长度的子串
+                    for (size_t len = 1; len <= num_chars - pos; len++) {
+                        char* substr = join_chars(chars, pos, pos + len);
+                        if (!substr) continue;
+                        
+                        // SentencePiece中，多数token以"▁"（Unicode U+2581）开头
+                        // 这里我们简化处理，直接尝试查找token
+                        int32_t id = tokenizer_token_to_id(tokenizer, substr);
+                        if (id >= 0 && len > best_len) {
+                            best_id = id;
+                            best_len = len;
+                        }
+                        
+                        free(substr);
+                    }
+                    
+                    // 如果找到匹配项，添加到结果
+                    if (best_id >= 0) {
+                        tokens[(*num_tokens)++] = best_id;
+                        pos += best_len;
+                    } else {
+                        // 没有找到匹配，使用未知令牌并前进一个字符
+                        if (tokenizer->config.unk_token) {
+                            int32_t unk_id = tokenizer_token_to_id(tokenizer, tokenizer->config.unk_token);
+                            if (unk_id >= 0) {
+                                tokens[(*num_tokens)++] = unk_id;
+                            }
+                        }
+                        pos++;
+                    }
+                }
+                
+                // 清理
+                free_chars(chars, num_chars);
+            }
             break;
     }
     
@@ -401,6 +761,29 @@ int tokenizer_save(const Tokenizer* tokenizer, const char* path) {
     if (!fp) return -1;
     
     // TODO: 生成配置JSON
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"model_type\": \"%s\",\n", 
+        tokenizer->config.type == TOKENIZER_BPE ? "bpe" :
+        tokenizer->config.type == TOKENIZER_WORDPIECE ? "wordpiece" :
+        tokenizer->config.type == TOKENIZER_UNIGRAM ? "unigram" : "sentencepiece");
+    fprintf(fp, "  \"add_special_tokens\": %s,\n", 
+        tokenizer->config.add_special_tokens ? "true" : "false");
+    fprintf(fp, "  \"add_prefix_space\": %s,\n", 
+        tokenizer->config.add_prefix_space ? "true" : "false");
+    
+    if (tokenizer->config.unk_token)
+        fprintf(fp, "  \"unk_token\": \"%s\",\n", tokenizer->config.unk_token);
+    if (tokenizer->config.pad_token)
+        fprintf(fp, "  \"pad_token\": \"%s\",\n", tokenizer->config.pad_token);
+    if (tokenizer->config.bos_token)
+        fprintf(fp, "  \"bos_token\": \"%s\",\n", tokenizer->config.bos_token);
+    if (tokenizer->config.eos_token)
+        fprintf(fp, "  \"eos_token\": \"%s\",\n", tokenizer->config.eos_token);
+    if (tokenizer->config.mask_token)
+        fprintf(fp, "  \"mask_token\": \"%s\",\n", tokenizer->config.mask_token);
+    
+    fprintf(fp, "  \"vocab_size\": %zu\n", tokenizer->vocab_size);
+    fprintf(fp, "}\n");
     
     fclose(fp);
     
@@ -429,6 +812,15 @@ int tokenizer_save(const Tokenizer* tokenizer, const char* path) {
         if (!fp) return -1;
         
         // TODO: 保存BPE合并规则
+        BPEMergeTable* merges = (BPEMergeTable*)tokenizer->merges;
+        
+        // 写入版本信息
+        fprintf(fp, "#version: 0.2\n");
+        
+        // 按优先级排序写入合并规则
+        for (size_t i = 0; i < merges->num_merges; i++) {
+            fprintf(fp, "%s\n", merges->merges[i].pair);
+        }
         
         fclose(fp);
     }
@@ -448,15 +840,74 @@ int tokenizer_load(Tokenizer** tokenizer, const char* path) {
     if (!fp) return -1;
     
     // TODO: 解析配置JSON
+    TokenizerConfig config = {0};
+    char line[1024];
+    char model_type[32] = {0};
+    
+    while (fgets(line, sizeof(line), fp)) {
+        // 简单解析JSON，仅用于演示，实际项目请使用JSON库
+        if (strstr(line, "\"model_type\"")) {
+            sscanf(line, "  \"model_type\": \"%[^\"]\"", model_type);
+            if (strcmp(model_type, "bpe") == 0) config.type = TOKENIZER_BPE;
+            else if (strcmp(model_type, "wordpiece") == 0) config.type = TOKENIZER_WORDPIECE;
+            else if (strcmp(model_type, "unigram") == 0) config.type = TOKENIZER_UNIGRAM;
+            else if (strcmp(model_type, "sentencepiece") == 0) config.type = TOKENIZER_SENTENCEPIECE;
+        } else if (strstr(line, "\"add_special_tokens\"")) {
+            char value[8];
+            sscanf(line, "  \"add_special_tokens\": %s", value);
+            config.add_special_tokens = (strcmp(value, "true,") == 0);
+        } else if (strstr(line, "\"add_prefix_space\"")) {
+            char value[8];
+            sscanf(line, "  \"add_prefix_space\": %s", value);
+            config.add_prefix_space = (strcmp(value, "true,") == 0);
+        } else if (strstr(line, "\"unk_token\"")) {
+            char token[64];
+            sscanf(line, "  \"unk_token\": \"%[^\"]\"", token);
+            config.unk_token = strdup(token);
+        } else if (strstr(line, "\"pad_token\"")) {
+            char token[64];
+            sscanf(line, "  \"pad_token\": \"%[^\"]\"", token);
+            config.pad_token = strdup(token);
+        } else if (strstr(line, "\"bos_token\"")) {
+            char token[64];
+            sscanf(line, "  \"bos_token\": \"%[^\"]\"", token);
+            config.bos_token = strdup(token);
+        } else if (strstr(line, "\"eos_token\"")) {
+            char token[64];
+            sscanf(line, "  \"eos_token\": \"%[^\"]\"", token);
+            config.eos_token = strdup(token);
+        } else if (strstr(line, "\"mask_token\"")) {
+            char token[64];
+            sscanf(line, "  \"mask_token\": \"%[^\"]\"", token);
+            config.mask_token = strdup(token);
+        }
+    }
     
     fclose(fp);
     
-    // 创建配置
-    TokenizerConfig config = {0};
+    // 设置词汇表文件路径
     char vocab_path[512];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.txt", path);
-    config.vocab_file = vocab_path;
+    config.vocab_file = strdup(vocab_path);
+    
+    // 设置BPE合并规则文件路径（如果需要）
+    if (config.type == TOKENIZER_BPE) {
+        char merges_path[512];
+        snprintf(merges_path, sizeof(merges_path), "%s/merges.txt", path);
+        config.merges_file = strdup(merges_path);
+    }
     
     // 初始化分词器
-    return tokenizer_init(tokenizer, &config);
+    int result = tokenizer_init(tokenizer, &config);
+    
+    // 清理
+    free((void*)config.vocab_file);
+    if (config.merges_file) free((void*)config.merges_file);
+    if (config.unk_token) free((void*)config.unk_token);
+    if (config.pad_token) free((void*)config.pad_token);
+    if (config.bos_token) free((void*)config.bos_token);
+    if (config.eos_token) free((void*)config.eos_token);
+    if (config.mask_token) free((void*)config.mask_token);
+    
+    return result;
 } 

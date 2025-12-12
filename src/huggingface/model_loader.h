@@ -48,6 +48,14 @@ typedef struct {
     size_t num_layers;             // 层数量
     void* tokenizer;               // 分词器
     void* device;                  // 设备指针
+    
+    // 额外模型参数
+    size_t hidden_size;           // 隐藏层大小
+    size_t vocab_size;            // 词汇表大小
+    size_t num_attention_heads;   // 注意力头数量
+    size_t intermediate_size;     // 中间层大小
+    size_t max_position_embeddings; // 位置嵌入最大长度
+    char* model_type;            // 模型类型
 } HFModel;
 
 // 初始化模型加载器
